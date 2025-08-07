@@ -45,14 +45,10 @@ class SafStreamPlugin : FlutterPlugin, MethodCallHandler {
                         val fileUriStr = call.argument<String>("fileUri")!!
                         val session = call.argument<String>("session")!!
                         val bufferSize = call.argument<Int>("bufferSize") ?: (4 * 1024 * 1024)
-                        val start = call.argument<Int>("start")
+                        val start = call.argument<Int>("start")?.toLong()
 
-
-                        val inStream =
-                            context.contentResolver.openInputStream(fileUriStr.toUri())
-                                ?: throw Exception("Stream creation failed")
                         launch(Dispatchers.Main) {
-                            val streamHandler = ReadFileHandler(inStream, bufferSize, start)
+                            val streamHandler = ReadFileHandler(fileUriStr, context, bufferSize, start)
                             val channelName = "saf_stream/readFile/$session"
                             EventChannel(
                                 pluginBinding?.binaryMessenger,
@@ -418,32 +414,42 @@ class SafStreamPlugin : FlutterPlugin, MethodCallHandler {
 }
 
 class ReadFileHandler(
-    private val inStream: InputStream,
+    private val fileUri: String,
+    private val context: Context,
     private val bufferSize: Int,
-    private val start: Int?
+    private val start: Long?
 ) : EventChannel.StreamHandler {
     private var eventSink: EventChannel.EventSink? = null
     private var cancelled = false
+    private var reader: NativeFileReader? = null
 
     override fun onListen(p0: Any?, sink: EventChannel.EventSink) {
         eventSink = sink
         CoroutineScope(Dispatchers.IO).launch {
             try {
+                val uri = fileUri.toUri()
+                val pfd = context.contentResolver.openFileDescriptor(uri, "r")
+                    ?: throw Exception("Failed to open file descriptor")
+                
+                val fileSize = DocumentFile.fromSingleUri(context, uri)?.length() ?: 0L
+                reader = NativeFileReader.fromFileDescriptor(pfd, fileSize)
+
+                var offset = start ?: 0L
                 val buffer = ByteArray(bufferSize)
-                inStream.use { stream ->
-                    if (start != null) {
-                        stream.skip(start.toLong())
-                    }
-                    var rc: Int = stream.read(buffer)
-                    while (rc != -1 && !cancelled) {
-                        val chunk = buffer.copyOf(rc)
-                        launch(Dispatchers.Main) { sink.success(chunk) }
-                        rc = stream.read(buffer)
-                    }
-                    launch(Dispatchers.Main) { sink.endOfStream() }
+
+                while (!cancelled && offset < fileSize) {
+                    val remaining = (fileSize - offset).coerceAtMost(bufferSize.toLong()).toInt()
+                    reader?.read(offset, buffer, remaining)
+                    val chunk = if (remaining == bufferSize) buffer else buffer.copyOf(remaining)
+                    launch(Dispatchers.Main) { sink.success(chunk) }
+                    offset += remaining
                 }
+                
+                launch(Dispatchers.Main) { sink.endOfStream() }
             } catch (err: Exception) {
                 launch(Dispatchers.Main) { sink.error("ReadFileError", err.message, null) }
+            } finally {
+                reader?.close()
             }
         }
     }
@@ -451,7 +457,9 @@ class ReadFileHandler(
     override fun onCancel(p0: Any?) {
         eventSink = null
         cancelled = true
+        reader?.close()
     }
+}
 }
 
 class CustomReadStream(
